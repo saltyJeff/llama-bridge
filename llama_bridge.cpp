@@ -1,12 +1,11 @@
 #include "llama_bridge.h"
-#include <iostream>
 #include <llama.h>
-#include <nlohmann/json.hpp>
 #include <minja.hpp> // imports nhlohmann json into global namespace??
+#include <nlohmann/json.hpp>
+#include <regex>
 #include <string>
 #include <string_view>
 #include <vector>
-#include <regex>
 
 using namespace std;
 
@@ -63,13 +62,13 @@ struct llama_bridge_obj
     bool thinking = false;
 
     vector<char> strbuf;
-    vector<llama_token> tokens_buf; // reuse allocation for tokenization
+    vector<llama_token> cached_tokens; // Tracks exact tokens in the KV cache
     json chat_history = json::array();
 
     llama_bridge_obj(const char *model_path, const char *device_name)
     {
         llama_model_params model_params = llama_model_default_params();
-        model_params.n_gpu_layers = -1; // -1 means offload as many layers to VRAM as possible automatically
+        model_params.n_gpu_layers = -1;
 
         if (!device_name || !device_name[0])
         {
@@ -95,13 +94,11 @@ struct llama_bridge_obj
 
         vocab = llama_model_get_vocab(model);
         const char *raw_tmpl = llama_model_chat_template(model, nullptr);
-        // will error because template expects to be used in a tool context
         std::string new_tmpl = regex_replace(raw_tmpl, regex{"multi_step_tool=true"}, "multi_step_tool=false");
         tmpl = minja::Parser::parse(new_tmpl, {});
-        cout << llama_model_chat_template(model, nullptr) << endl;
 
         llama_context_params ctx_params = llama_context_default_params();
-        ctx_params.n_ctx = 64 * 1024;
+        ctx_params.n_ctx = 48 * 1024;
         ctx_params.n_batch = 512;
         ctx_params.no_perf = true;
         ctx_params.flash_attn_type = llama_flash_attn_type::LLAMA_FLASH_ATTN_TYPE_AUTO;
@@ -132,7 +129,7 @@ struct llama_bridge_obj
             llama_model_free(model);
     }
 
-    std::string apply_chat_template(const std::vector<llama_chat_message> &msgs, bool thinking, bool add_ass)
+    std::string apply_chat_template(const std::vector<llama_chat_message> &msgs, bool thinking_flag, bool add_ass)
     {
         json minja_ctx = json::object();
         json minja_ctx_msgs = json::array();
@@ -143,14 +140,10 @@ struct llama_bridge_obj
             {
                 throw std::runtime_error(std::string("Invalid role: ") + std::string(role));
             }
-            minja_ctx_msgs.push_back(json
-            {
-                {"role", msg.role},
-                {"content", msg.content}
-             });
+            minja_ctx_msgs.push_back(json{{"role", msg.role}, {"content", msg.content}});
         }
         minja_ctx["messages"] = minja_ctx_msgs;
-        minja_ctx["enable_thinking"] = thinking;
+        minja_ctx["enable_thinking"] = thinking_flag;
         minja_ctx["add_generation_prompt"] = add_ass;
         minja_ctx["multi_step_tool"] = false;
         return tmpl->render(minja::Context::make(minja::Value(minja_ctx)));
@@ -163,10 +156,8 @@ struct llama_bridge_obj
         min_p = min_p_in;
         top_p = top_p_in;
         seed = (uint32_t)seed_in;
-
         if (smpl)
             llama_sampler_free(smpl);
-
         auto sparams = llama_sampler_chain_default_params();
         sparams.no_perf = true;
         smpl = llama_sampler_chain_init(sparams);
@@ -176,7 +167,6 @@ struct llama_bridge_obj
             llama_sampler_chain_add(smpl, llama_sampler_init_top_p((float)top_p, 1));
         if (min_p >= 0)
             llama_sampler_chain_add(smpl, llama_sampler_init_min_p((float)min_p, 1));
-
         if (temp > 0.0)
         {
             llama_sampler_chain_add(smpl, llama_sampler_init_temp((float)temp));
@@ -187,13 +177,24 @@ struct llama_bridge_obj
             llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
         }
     }
+    std::vector<llama_token> tokenize(const std::string &text, bool add_special)
+    {
+        int n_tokens = -llama_tokenize(vocab, text.c_str(), text.size(), nullptr, 0, add_special, true);
+        if (n_tokens <= 0)
+            return {};
+        std::vector<llama_token> res(n_tokens);
+        if (llama_tokenize(vocab, text.c_str(), text.size(), res.data(), res.size(), add_special, true) < 0)
+        {
+            throw runtime_error("Failed to tokenize");
+        }
+        return res;
+    }
 
     void decode_tokens(const llama_token *tokens, size_t num_tokens)
     {
-        if (n_pos + num_tokens > n_ctx)
-        {
+        if (n_pos + num_tokens > (size_t)n_ctx)
             throw runtime_error("Out of context");
-        }
+
         const int n_batch = llama_n_batch(ctx);
         for (size_t i = 0; i < num_tokens; i += n_batch)
         {
@@ -205,30 +206,17 @@ struct llama_bridge_obj
         }
     }
 
-    void eval_string(const string &text, bool add_special)
-    {
-        int n_prompt = -llama_tokenize(vocab, text.c_str(), text.size(), nullptr, 0, add_special, true);
-        if (n_prompt <= 0)
-            return;
-
-        tokens_buf.resize(n_prompt);
-        if (llama_tokenize(vocab, text.c_str(), text.size(), tokens_buf.data(), tokens_buf.size(), add_special, true) <
-            0)
-        {
-            throw runtime_error("Failed to tokenize");
-        }
-
-        decode_tokens(tokens_buf.data(), tokens_buf.size());
-    }
-
     void reset_ctx(const json &initial_prompts, bool thinking_in)
     {
         thinking = thinking_in;
         chat_history = json::array();
+        cached_tokens.clear();
+        n_pos = 0;
+
+        llama_memory_clear(llama_get_memory(ctx), true);
+
         vector<llama_chat_message> chat_msgs;
         bool inject_system = true;
-        llama_memory_clear(llama_get_memory(ctx), true);
-        n_pos = 0;
 
         if (initial_prompts.is_array() && !initial_prompts.empty())
         {
@@ -237,9 +225,7 @@ struct llama_bridge_obj
                 const string &role = msg[0].get_ref<const string &>();
                 const string &content = msg[1].get_ref<const string &>();
                 if (role == "system")
-                {
                     inject_system = false;
-                }
                 chat_history.push_back(json{role, content});
                 chat_msgs.push_back({role.c_str(), content.c_str()});
             }
@@ -250,22 +236,55 @@ struct llama_bridge_obj
             chat_msgs.insert(chat_msgs.begin(), {"system", ""});
         }
 
-        eval_string(apply_chat_template(chat_msgs, thinking, false), true);
+        string formatted = apply_chat_template(chat_msgs, thinking, false);
+
+        // Tokenize and decode initial state
+        cached_tokens = tokenize(formatted, true);
+        decode_tokens(cached_tokens.data(), cached_tokens.size());
     }
 
     const char *prompt(const string &text)
     {
         strbuf.clear();
 
-        // Format the new user turn + model generation header
-        vector<llama_chat_message> chat_msgs = {{"user", text.c_str()}};
+        // 1. Build the full message history to pass to minja
+        chat_history.push_back(json{"user", text});
+        vector<llama_chat_message> chat_msgs;
+        for (const auto &msg : chat_history)
+        {
+            chat_msgs.push_back({msg[0].get_ref<const string &>().c_str(), msg[1].get_ref<const string &>().c_str()});
+        }
+
+        // 2. Format the entire sequence and let minja trim/strip whatever it wants
         string formatted = apply_chat_template(chat_msgs, thinking, true);
 
-        // add_special is false since we are appending to the context (BOS was already added in reset_ctx)
-        eval_string(formatted, false);
+        // 3. Tokenize the entire template (must use add_special=true to match reset_ctx)
+        vector<llama_token> new_tokens = tokenize(formatted, true);
 
-        chat_history.push_back(json{"user", text});
+        // 4. Token Diffing: Find the exact divergence point
+        size_t min_len = std::min(cached_tokens.size(), new_tokens.size());
+        auto mismatch_it = std::mismatch(cached_tokens.begin(), cached_tokens.begin() + min_len, new_tokens.begin());
+        size_t match_len = std::distance(cached_tokens.begin(), mismatch_it.first);
 
+        // 5. Truncate KV Cache if tags were stripped or altered
+        if (match_len < cached_tokens.size())
+        {
+            // Sequence ID 0, slice from match_len to the end (-1)
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, match_len, -1);
+            cached_tokens.resize(match_len);
+            n_pos = match_len;
+        }
+
+        // 6. Decode only the new suffix
+        if (match_len < new_tokens.size())
+        {
+            size_t delta_len = new_tokens.size() - match_len;
+            decode_tokens(new_tokens.data() + match_len, delta_len);
+            // Append evaluated tokens to cache
+            cached_tokens.insert(cached_tokens.end(), new_tokens.begin() + match_len, new_tokens.end());
+        }
+
+        // --- Generation Loop ---
         bool eog_reached = false;
         char buf[128];
         while (n_pos < n_ctx)
@@ -274,9 +293,8 @@ struct llama_bridge_obj
 
             if (llama_vocab_is_eog(vocab, new_token_id))
             {
-                // Decode the EOG token into the KV cache so the model turn
-                // is properly closed for subsequent multi-turn prompt() calls.
                 decode_tokens(&new_token_id, 1);
+                cached_tokens.push_back(new_token_id); // Sync EOG to cache
                 eog_reached = true;
                 break;
             }
@@ -294,6 +312,7 @@ struct llama_bridge_obj
             }
 
             decode_tokens(&new_token_id, 1);
+            cached_tokens.push_back(new_token_id); // Sync generated token to cache
         }
 
         if (!eog_reached)
@@ -303,6 +322,7 @@ struct llama_bridge_obj
 
         strbuf.push_back('\0');
         chat_history.push_back(json{"assistant", strbuf.data()});
+
         return strbuf.data();
     }
 
@@ -391,11 +411,7 @@ const char *llama_bridge_invoke(llama_bridge_obj *obj, const char *cmd)
 }
 
 void llama_bridge_destroy(llama_bridge_obj *obj)
-{
-    delete obj;
-}
+{ delete obj; }
 
 void llama_bridge_set_log_callback(llama_bridge_log_callback_fn cb, void *user_data)
-{
-    llama_log_set(reinterpret_cast<ggml_log_callback>(cb), user_data);
-}
+{ llama_log_set(reinterpret_cast<ggml_log_callback>(cb), user_data); }
