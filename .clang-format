@@ -1,0 +1,9 @@
+---
+BasedOnStyle: Microsoft
+ColumnLimit: 120
+AccessModifierOffset: -4
+EmptyLineBeforeAccessModifier: Never
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortBlocksOnASingleLine: true
+AllowShortCaseLabelsOnASingleLine: true
+Cpp11BracedListStyle: true
