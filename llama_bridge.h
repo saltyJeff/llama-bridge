@@ -69,7 +69,7 @@ extern "C"
      *      - think_budget: max tokens allowed for the thinking phase before a soft
      *        "wrap it up" nudge is injected. Defaults to n_ctx/8. Ignored if thinking is false.
      *      - Model messages in initial_prompts have thinking blocks stripped.
-     *   ["set_sampler", {"temp": double?, "top_k": int?, "min_p": double?, "top_p": double?, "seed": int?}]; returns
+     *   ["set_sampler", {"temp": double?, "top_k": int?, "min_p": double?, "top_p": double?, "presence_penalty": double?, "seed": int?}]; returns
      * nullptr on success
      *   ["get_status", {}]; returns {
      *      "history": msg[],
@@ -77,6 +77,7 @@ extern "C"
      *      "min_p": number,
      *      "top_p": number,
      *      "temp": number,
+     *      "presence_penalty": number,
      *      "seed": number,
      *      "thinking": bool,
      *      "think_budget": number

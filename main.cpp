@@ -107,7 +107,7 @@ int main()
     // Run the automated test suite
     run_test(obj, "Initial Status", {"get_status", json::object()});
 
-    run_test(obj, "Sampler Configuration", {"set_sampler", {{"temp", 0.7}, {"top_k", 40}, {"seed", 42}}});
+    run_test(obj, "Sampler Configuration", {"set_sampler", {{"temp", 0.7}, {"top_k", 40}, {"presence_penalty", 1.2}, {"seed", 42}}});
 
     run_test(obj, "Updated Status", {"get_status", json::object()});
 

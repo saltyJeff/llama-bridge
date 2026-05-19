@@ -61,6 +61,7 @@ struct llama_bridge_obj
     double top_p = 0.95;
     double min_p = -0.8;
     double temp = 0.7;
+    double presence_penalty = 1.5;
     uint32_t seed = LLAMA_DEFAULT_SEED;
     bool thinking = false;
     int think_budget = -1; // -1 means use default (n_ctx / 8)
@@ -121,7 +122,7 @@ struct llama_bridge_obj
 
         n_ctx = llama_n_ctx(ctx);
         think_budget = n_ctx / 8;
-        set_sampler_params(temp, top_k, min_p, top_p, seed);
+        set_sampler_params(temp, top_k, min_p, top_p, presence_penalty, seed);
 
         // Resolve the </think> token ID from the vocab
         const char *end_think_str = "</think>";
@@ -237,12 +238,13 @@ struct llama_bridge_obj
         return tmpl->render(minja::Context::make(minja::Value(minja_ctx)));
     }
 
-    void set_sampler_params(double temp_in, int32_t top_k_in, double min_p_in, double top_p_in, int64_t seed_in)
+    void set_sampler_params(double temp_in, int32_t top_k_in, double min_p_in, double top_p_in, double presence_penalty_in, int64_t seed_in)
     {
         temp = temp_in;
         top_k = top_k_in;
         min_p = min_p_in;
         top_p = top_p_in;
+        presence_penalty = presence_penalty_in;
         seed = (uint32_t)seed_in;
         if (smpl)
             llama_sampler_free(smpl);
@@ -255,6 +257,8 @@ struct llama_bridge_obj
             llama_sampler_chain_add(smpl, llama_sampler_init_top_p((float)top_p, 1));
         if (min_p >= 0)
             llama_sampler_chain_add(smpl, llama_sampler_init_min_p((float)min_p, 1));
+        if (presence_penalty != 0.0)
+            llama_sampler_chain_add(smpl, llama_sampler_init_penalties(64, 1.0f, 0.0f, (float)presence_penalty));
         if (temp > 0.0)
         {
             llama_sampler_chain_add(smpl, llama_sampler_init_temp((float)temp));
@@ -462,6 +466,7 @@ struct llama_bridge_obj
         j["min_p"] = min_p;
         j["top_p"] = top_p;
         j["temp"] = temp;
+        j["presence_penalty"] = presence_penalty;
         j["seed"] = seed;
         j["thinking"] = thinking;
         j["think_budget"] = think_budget;
@@ -523,6 +528,7 @@ const char *llama_bridge_invoke(llama_bridge_obj *obj, const char *cmd)
         {
             obj->set_sampler_params(params.value("temp", obj->temp), params.value("top_k", obj->top_k),
                                     params.value("min_p", obj->min_p), params.value("top_p", obj->top_p),
+                                    params.value("presence_penalty", obj->presence_penalty),
                                     params.value("seed", obj->seed));
             return nullptr;
         }
