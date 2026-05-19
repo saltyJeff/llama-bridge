@@ -1,9 +1,9 @@
 #include "llama_bridge.h"
+#include <atomic>
 #include <llama.h>
 #include <minja.hpp> // imports nhlohmann json into global namespace??
 #include <nlohmann/json.hpp>
 #include <regex>
-#include <atomic>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -63,6 +63,8 @@ struct llama_bridge_obj
     double temp = 0.7;
     uint32_t seed = LLAMA_DEFAULT_SEED;
     bool thinking = false;
+    int think_budget = -1; // -1 means use default (n_ctx / 8)
+    llama_token end_think_token = -1;
 
     vector<llama_token> cached_tokens; // Tracks exact tokens in the KV cache
     json chat_history = json::array();
@@ -116,7 +118,34 @@ struct llama_bridge_obj
         }
 
         n_ctx = llama_n_ctx(ctx);
+        think_budget = n_ctx / 8;
         set_sampler_params(temp, top_k, min_p, top_p, seed);
+
+        // Resolve the </think> token ID from the vocab
+        {
+            const char *end_think_str = "</think>";
+            llama_token tok_buf[8];
+            int n = llama_tokenize(vocab, end_think_str, (int)strlen(end_think_str), tok_buf, 8, false, true);
+            if (n == 1)
+            {
+                end_think_token = tok_buf[0];
+            }
+            else
+            {
+                cerr << "[llama_bridge] Fallback: scan vocab for exact match" << endl;
+                // Fallback: scan vocab for exact match
+                int32_t n_vocab = llama_vocab_n_tokens(vocab);
+                for (int32_t i = 0; i < n_vocab; i++)
+                {
+                    const char *txt = llama_vocab_get_text(vocab, i);
+                    if (txt && strcmp(txt, "</think>") == 0)
+                    {
+                        end_think_token = i;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     ~llama_bridge_obj()
@@ -208,10 +237,11 @@ struct llama_bridge_obj
         }
     }
 
-    void reset_ctx(const json &initial_prompts, bool thinking_in)
+    void reset_ctx(const json &initial_prompts, bool thinking_in, int think_budget_in)
     {
         halt_flag.store(false);
         thinking = thinking_in;
+        think_budget = think_budget_in < 0 ? (n_ctx / 8) : think_budget_in;
         chat_history = json::array();
         cached_tokens.clear();
         n_pos = 0;
@@ -263,7 +293,7 @@ struct llama_bridge_obj
         // 2. Format the entire sequence and let minja trim/strip whatever it wants
         string formatted = apply_chat_template(chat_msgs, thinking, true);
 
-        std::cout<< "FORMAT" << formatted << std::endl;
+        std::cout << "FORMAT" << formatted << std::endl;
 
         // 3. Tokenize the entire template (must use add_special=true to match reset_ctx)
         vector<llama_token> new_tokens = tokenize(formatted, true);
@@ -296,6 +326,9 @@ struct llama_bridge_obj
 
         // --- Generation Loop ---
         bool eog_reached = false;
+        bool in_thinking = thinking; // if thinking mode is on, we start in the thinking phase
+        bool budget_injected = false;
+        int think_tokens_generated = 0;
         char buf[128];
         while (n_pos < n_ctx)
         {
@@ -313,6 +346,12 @@ struct llama_bridge_obj
                 break;
             }
 
+            // Track thinking phase: detect </think> token
+            if (in_thinking && end_think_token >= 0 && new_token_id == end_think_token)
+            {
+                in_thinking = false;
+            }
+
             int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
             if (n < 0)
             {
@@ -327,6 +366,26 @@ struct llama_bridge_obj
 
             decode_tokens(&new_token_id, 1);
             cached_tokens.push_back(new_token_id); // Sync generated token to cache
+
+            // Think budget enforcement
+            if (in_thinking)
+            {
+                think_tokens_generated++;
+                if (!budget_injected && think_budget > 0 && think_tokens_generated >= think_budget)
+                {
+                    budget_injected = true;
+                    // Inject a soft nudge to wrap up thinking
+                    const string nudge = "\n[Reasoning budget exceeded, let's wrap this up and produce the answer.]\n";
+                    auto nudge_tokens = tokenize(nudge, false);
+                    if (!nudge_tokens.empty())
+                    {
+                        decode_tokens(nudge_tokens.data(), nudge_tokens.size());
+                        cached_tokens.insert(cached_tokens.end(), nudge_tokens.begin(), nudge_tokens.end());
+                        // Also append to promptbuf so it appears in output
+                        promptbuf.insert(promptbuf.end(), nudge.begin(), nudge.end());
+                    }
+                }
+            }
         }
 
         if (!eog_reached)
@@ -350,13 +409,11 @@ struct llama_bridge_obj
         j["temp"] = temp;
         j["seed"] = seed;
         j["thinking"] = thinking;
+        j["think_budget"] = think_budget;
         return j;
     }
 
-    int token_count() const
-    {
-        return n_pos;
-    }
+    int token_count() const { return n_pos; }
 };
 
 llama_bridge_obj *llama_bridge_create(const char *model_path, const char *device_name)
@@ -404,7 +461,7 @@ const char *llama_bridge_invoke(llama_bridge_obj *obj, const char *cmd)
             {
                 initial = params["initial_prompts"];
             }
-            obj->reset_ctx(initial, params.value("thinking", false));
+            obj->reset_ctx(initial, params.value("thinking", false), params.value("think_budget", -1));
             return nullptr;
         }
         else if (method == "set_sampler")
@@ -439,7 +496,11 @@ const char *llama_bridge_invoke(llama_bridge_obj *obj, const char *cmd)
 }
 
 void llama_bridge_destroy(llama_bridge_obj *obj)
-{ delete obj; }
+{
+    delete obj;
+}
 
 void llama_bridge_set_log_callback(llama_bridge_log_callback_fn cb, void *user_data)
-{ llama_log_set(reinterpret_cast<ggml_log_callback>(cb), user_data); }
+{
+    llama_log_set(reinterpret_cast<ggml_log_callback>(cb), user_data);
+}

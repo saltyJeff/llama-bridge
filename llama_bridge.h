@@ -63,9 +63,11 @@ extern "C"
      *   ["prompt", {"text": string}]; returns string on success
      *      - Each prompt() call retains multi-turn context from prior prompt() calls
      *        within the same session. Call reset_ctx to start fresh.
-     *   ["reset_ctx", {"initial_prompts": msg[]?, "thinking": bool?}]; returns nullptr on success
+     *   ["reset_ctx", {"initial_prompts": msg[]?, "thinking": bool?, "think_budget": int?}]; returns nullptr on success
      *      - Clears context and chat history. Optionally seeds with initial_prompts.
      *      - Optionally set the model into thinking mode
+     *      - think_budget: max tokens allowed for the thinking phase before a soft
+     *        "wrap it up" nudge is injected. Defaults to n_ctx/8. Ignored if thinking is false.
      *      - Model messages in initial_prompts have thinking blocks stripped.
      *   ["set_sampler", {"temp": double?, "top_k": int?, "min_p": double?, "top_p": double?, "seed": int?}]; returns
      * nullptr on success
@@ -76,7 +78,8 @@ extern "C"
      *      "top_p": number,
      *      "temp": number,
      *      "seed": number,
-     *      "thinking": bool
+     *      "thinking": bool,
+     *      "think_budget": number
      *   } on success
      *   ["token_count", {}]; returns number on success.
      *     - This method is thread safe and can be called from another thread.

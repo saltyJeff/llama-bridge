@@ -117,6 +117,15 @@ int main()
 
     run_test(obj, "Prompt (With Thinking)", {"prompt", {{"text", "Explain quantum entanglement in one sentence."}}});
 
+    // --- Think Budget Test ---
+    run_test(obj, "Context Reset with LOW Think Budget",
+             {"reset_ctx", {{"thinking", true}, {"think_budget", 32}}});
+
+    run_test(obj, "Status (verify think_budget)", {"get_status", json::object()});
+
+    run_test(obj, "Prompt (Low Think Budget)",
+             {"prompt", {{"text", "Could 20 monkeys generate enough power to pull a kitten on a sleigh?"}}});
+
     run_test(obj, "Context Reset with Initial Prompts",
              {"reset_ctx",
               {{"initial_prompts",
