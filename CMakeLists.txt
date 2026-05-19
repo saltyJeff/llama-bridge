@@ -72,9 +72,9 @@ set_target_properties(llama_bridge_driver PROPERTIES
     VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:llama_bridge_driver>"
 )
 
-# Target to create a 7z archive of the dist folder
+# Target to create a zip archive of the dist folder
 add_custom_target(archive-dist
-    COMMAND ${CMAKE_COMMAND} -E tar "cfv" "${CMAKE_BINARY_DIR}/llama-bridge-dist.7z" --format=7zip "$<TARGET_FILE_DIR:llama_bridge_driver>"
+    COMMAND ${CMAKE_COMMAND} -E tar "cfv" "${CMAKE_BINARY_DIR}/llama-bridge-dist.zip" --format=zip "$<TARGET_FILE_DIR:llama_bridge_driver>"
     DEPENDS llama_bridge_driver
-    COMMENT "Creating distribution archive llama-bridge-dist.7z..."
+    COMMENT "Creating distribution archive llama-bridge-dist.zip..."
 )

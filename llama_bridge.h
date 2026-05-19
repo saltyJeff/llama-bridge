@@ -78,6 +78,11 @@ extern "C"
      *      "seed": number,
      *      "thinking": bool
      *   } on success
+     *   ["token_count", {}]; returns number on success.
+     *     - This method is thread safe and can be called from another thread.
+     *     - Use to monitor generation progress during a long generation session (it should keep increasing).
+     *   ["halt_prompt", {}]; returns nullptr on success.
+     *     - Halts an ongoing prompt() call. Thread safe.
      *
      *   msg is a 2-element array of ["role" (user|assistant|system), string]
      *   question mark means optional field

@@ -3,6 +3,7 @@
 #include <minja.hpp> // imports nhlohmann json into global namespace??
 #include <nlohmann/json.hpp>
 #include <regex>
+#include <atomic>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -11,7 +12,7 @@ using namespace std;
 
 const char *llama_bridge_get_devices(const char *backend_path)
 {
-    thread_local string strbuf;
+    thread_local string devbuf;
     if (backend_path && backend_path[0])
         ggml_backend_load_all_from_path(backend_path);
     else
@@ -38,8 +39,8 @@ const char *llama_bridge_get_devices(const char *backend_path)
         ret_json = json::object();
         ret_json["err"] = "No devices found";
     }
-    strbuf = ret_json.dump();
-    return strbuf.c_str();
+    devbuf = ret_json.dump();
+    return devbuf.c_str();
 }
 
 struct llama_bridge_obj
@@ -54,14 +55,15 @@ struct llama_bridge_obj
     int n_ctx;
     int n_pos = 0;
 
-    int32_t top_k = 64;
+    std::atomic<bool> halt_flag{false};
+
+    int32_t top_k = 20;
     double top_p = 0.95;
-    double min_p = -1;
-    double temp = 1.0;
+    double min_p = -0.8;
+    double temp = 0.7;
     uint32_t seed = LLAMA_DEFAULT_SEED;
     bool thinking = false;
 
-    vector<char> strbuf;
     vector<llama_token> cached_tokens; // Tracks exact tokens in the KV cache
     json chat_history = json::array();
 
@@ -208,6 +210,7 @@ struct llama_bridge_obj
 
     void reset_ctx(const json &initial_prompts, bool thinking_in)
     {
+        halt_flag.store(false);
         thinking = thinking_in;
         chat_history = json::array();
         cached_tokens.clear();
@@ -233,6 +236,7 @@ struct llama_bridge_obj
 
         if (inject_system)
         {
+            chat_history.push_back({"system", ""});
             chat_msgs.insert(chat_msgs.begin(), {"system", ""});
         }
 
@@ -242,10 +246,11 @@ struct llama_bridge_obj
         cached_tokens = tokenize(formatted, true);
         decode_tokens(cached_tokens.data(), cached_tokens.size());
     }
-
+    vector<char> promptbuf;
     const char *prompt(const string &text)
     {
-        strbuf.clear();
+        // warning: returns pointers into promptbuf, so will be reset on next prompt() call.
+        promptbuf.clear();
 
         // 1. Build the full message history to pass to minja
         chat_history.push_back(json{"user", text});
@@ -257,6 +262,8 @@ struct llama_bridge_obj
 
         // 2. Format the entire sequence and let minja trim/strip whatever it wants
         string formatted = apply_chat_template(chat_msgs, thinking, true);
+
+        std::cout<< "FORMAT" << formatted << std::endl;
 
         // 3. Tokenize the entire template (must use add_special=true to match reset_ctx)
         vector<llama_token> new_tokens = tokenize(formatted, true);
@@ -284,11 +291,18 @@ struct llama_bridge_obj
             cached_tokens.insert(cached_tokens.end(), new_tokens.begin() + match_len, new_tokens.end());
         }
 
+        // 7. Clear halt flag before generation
+        halt_flag.store(false);
+
         // --- Generation Loop ---
         bool eog_reached = false;
         char buf[128];
         while (n_pos < n_ctx)
         {
+            if (halt_flag.load())
+            {
+                break;
+            }
             llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
 
             if (llama_vocab_is_eog(vocab, new_token_id))
@@ -302,13 +316,13 @@ struct llama_bridge_obj
             int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
             if (n < 0)
             {
-                size_t old_size = strbuf.size();
-                strbuf.resize(old_size - n);
-                llama_token_to_piece(vocab, new_token_id, strbuf.data() + old_size, -n, 0, true);
+                size_t old_size = promptbuf.size();
+                promptbuf.resize(old_size - n);
+                llama_token_to_piece(vocab, new_token_id, promptbuf.data() + old_size, -n, 0, true);
             }
             else
             {
-                strbuf.insert(strbuf.end(), buf, buf + n);
+                promptbuf.insert(promptbuf.end(), buf, buf + n);
             }
 
             decode_tokens(&new_token_id, 1);
@@ -320,13 +334,13 @@ struct llama_bridge_obj
             throw runtime_error("Out of context");
         }
 
-        strbuf.push_back('\0');
-        chat_history.push_back(json{"assistant", strbuf.data()});
+        promptbuf.push_back('\0');
+        chat_history.push_back(json{"assistant", promptbuf.data()});
 
-        return strbuf.data();
+        return promptbuf.data();
     }
 
-    const char *get_status()
+    json get_status() const
     {
         json j;
         j["history"] = chat_history;
@@ -336,10 +350,12 @@ struct llama_bridge_obj
         j["temp"] = temp;
         j["seed"] = seed;
         j["thinking"] = thinking;
-        string status = j.dump();
-        strbuf.assign(status.begin(), status.end());
-        strbuf.push_back('\0');
-        return strbuf.data();
+        return j;
+    }
+
+    int token_count() const
+    {
+        return n_pos;
     }
 };
 
@@ -364,6 +380,7 @@ const char *wrap_exception(const std::exception &e)
 
 const char *llama_bridge_invoke(llama_bridge_obj *obj, const char *cmd)
 {
+    thread_local string invokebuf;
     if (!obj)
         return wrap_exception(runtime_error("Null object"));
 
@@ -399,7 +416,18 @@ const char *llama_bridge_invoke(llama_bridge_obj *obj, const char *cmd)
         }
         else if (method == "get_status")
         {
-            return obj->get_status();
+            invokebuf = obj->get_status().dump();
+            return invokebuf.c_str();
+        }
+        else if (method == "token_count")
+        {
+            invokebuf = to_string(obj->token_count());
+            return invokebuf.c_str();
+        }
+        else if (method == "halt_prompt")
+        {
+            obj->halt_flag.store(true);
+            return nullptr;
         }
 
         return wrap_exception(runtime_error("Unknown method"));

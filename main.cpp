@@ -1,9 +1,9 @@
 #include <nlohmann/json.hpp>
 #include "llama_bridge.h"
-#include <iomanip>
+#include <chrono>
 #include <iostream>
 #include <string>
-#include <vector>
+#include <thread>
 
 #pragma execution_character_set("utf-8")
 
@@ -133,6 +133,8 @@ int main()
 
     run_test(obj, "Error Handling", {"invalid_method", json::object()});
 
+    run_test(obj, "Token Count", {"token_count", json::object()});
+
     // Start Interactive REPL Loop
     cout << "\n" << string(60, '=') << "\n";
     cout << " INTERACTIVE REPL MODE\n";
@@ -144,6 +146,21 @@ int main()
     cout << "  - Type '/get_status' to query the current session status.\n";
     cout << "  - Type '/exit' or '/quit' to exit the driver.\n";
     cout << "------------------------------------------------------------\n";
+
+    // Spawn background thread to print token count every 10 seconds
+    bool running = true;
+    json token_cmd = json::array({"token_count", json::object()});
+    thread monitor_thread([&]() {
+        while (running) {
+            this_thread::sleep_for(chrono::seconds(5));
+            if (!running)
+                break;
+            const char *count = llama_bridge_invoke(obj, token_cmd.dump().c_str());
+            if (count) {
+                cerr << "\n[Token Count: " << count << "]" << endl << "> " << flush;
+            }
+        }
+    });
 
     string line;
     while (true)
@@ -214,6 +231,10 @@ int main()
             }
         }
     }
+
+    running = false;
+    if (monitor_thread.joinable())
+        monitor_thread.join();
 
     print_separator("Cleanup");
     cout << "Destroying bridge object..." << endl;
