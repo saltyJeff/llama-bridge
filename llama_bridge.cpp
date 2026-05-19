@@ -106,8 +106,10 @@ struct llama_bridge_obj
         ctx_params.n_batch = 512;
         ctx_params.no_perf = true;
         ctx_params.flash_attn_type = llama_flash_attn_type::LLAMA_FLASH_ATTN_TYPE_AUTO;
-        ctx_params.type_k = GGML_TYPE_Q4_0;
-        ctx_params.type_v = GGML_TYPE_Q4_0;
+        ctx_params.type_k = GGML_TYPE_Q8_0;
+        ctx_params.type_v = GGML_TYPE_Q8_0;
+
+        ctx_params.offload_kqv = determine_offload_kqv(ctx_params);
 
         ctx = llama_init_from_model(model, ctx_params);
         if (!ctx)
@@ -122,30 +124,85 @@ struct llama_bridge_obj
         set_sampler_params(temp, top_k, min_p, top_p, seed);
 
         // Resolve the </think> token ID from the vocab
+        const char *end_think_str = "</think>";
+        llama_token tok_buf[8];
+        int n = llama_tokenize(vocab, end_think_str, (int)strlen(end_think_str), tok_buf, 8, false, true);
+        if (n == 1)
         {
-            const char *end_think_str = "</think>";
-            llama_token tok_buf[8];
-            int n = llama_tokenize(vocab, end_think_str, (int)strlen(end_think_str), tok_buf, 8, false, true);
-            if (n == 1)
-            {
-                end_think_token = tok_buf[0];
-            }
-            else
-            {
-                cerr << "[llama_bridge] Fallback: scan vocab for exact match" << endl;
-                // Fallback: scan vocab for exact match
-                int32_t n_vocab = llama_vocab_n_tokens(vocab);
-                for (int32_t i = 0; i < n_vocab; i++)
-                {
-                    const char *txt = llama_vocab_get_text(vocab, i);
-                    if (txt && strcmp(txt, "</think>") == 0)
-                    {
-                        end_think_token = i;
-                        break;
-                    }
-                }
-            }
+            end_think_token = tok_buf[0];
         }
+        else
+        {
+            throw runtime_error("Could not resolve </think> token");
+        }
+    }
+
+    bool determine_offload_kqv(const llama_context_params &ctx_params)
+    {
+        ggml_backend_dev_t active_dev = devices[0];
+
+        // CPU device doesn't have VRAM constraints, return default offload status (true)
+        if (ggml_backend_dev_type(active_dev) == GGML_BACKEND_DEVICE_TYPE_CPU)
+        {
+            return true;
+        }
+
+        size_t free_mem = 0;
+        size_t total_mem = 0;
+        ggml_backend_dev_memory(active_dev, &free_mem, &total_mem);
+
+        // Estimate KV Cache Size
+        int32_t n_layer = llama_model_n_layer(model);
+        int32_t n_head = llama_model_n_head(model);
+        int32_t n_head_kv = llama_model_n_head_kv(model);
+        int32_t n_embd = llama_model_n_embd(model);
+        int32_t head_dim = n_head > 0 ? (n_embd / n_head) : 0;
+
+        int32_t n_embd_k_gqa = n_head_kv * head_dim;
+        int32_t n_embd_v_gqa = n_head_kv * head_dim;
+
+        size_t row_size_k = ggml_row_size(ctx_params.type_k, n_embd_k_gqa);
+        size_t row_size_v = ggml_row_size(ctx_params.type_v, n_embd_v_gqa);
+
+        size_t layer_kv_size = row_size_k * ctx_params.n_ctx + row_size_v * ctx_params.n_ctx;
+        size_t total_kv_cache_size = layer_kv_size * n_layer;
+
+        // 1 GB Safety Margin
+        size_t safety_margin = 1ULL << 30;
+
+        // Retrieve active llama logging callback and log details
+        ggml_log_callback log_callback = nullptr;
+        void *log_user_data = nullptr;
+        llama_log_get(&log_callback, &log_user_data);
+
+        if (log_callback)
+        {
+            char log_buf[256];
+            snprintf(log_buf, sizeof(log_buf),
+                     "[llama-bridge] Active Device: %s, Free VRAM: %.2f MB, Estimated KV Cache Size: %.2f MB\n",
+                     ggml_backend_dev_name(active_dev), (double)free_mem / (1024.0 * 1024.0),
+                     (double)total_kv_cache_size / (1024.0 * 1024.0));
+            log_callback(GGML_LOG_LEVEL_INFO, log_buf, log_user_data);
+        }
+
+        if (free_mem < total_kv_cache_size + safety_margin)
+        {
+            if (log_callback)
+            {
+                log_callback(GGML_LOG_LEVEL_WARN,
+                             "[llama-bridge] Insufficient VRAM to offload KV cache with a 1GB safety margin. Disabling "
+                             "offload_kqv.\n",
+                             log_user_data);
+            }
+            return false;
+        }
+
+        if (log_callback)
+        {
+            log_callback(GGML_LOG_LEVEL_INFO, "[llama-bridge] Sufficient VRAM detected. Enabling offload_kqv.\n",
+                         log_user_data);
+        }
+        return true;
     }
 
     ~llama_bridge_obj()
@@ -292,8 +349,6 @@ struct llama_bridge_obj
 
         // 2. Format the entire sequence and let minja trim/strip whatever it wants
         string formatted = apply_chat_template(chat_msgs, thinking, true);
-
-        std::cout << "FORMAT" << formatted << std::endl;
 
         // 3. Tokenize the entire template (must use add_special=true to match reset_ctx)
         vector<llama_token> new_tokens = tokenize(formatted, true);
