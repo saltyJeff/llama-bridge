@@ -19,7 +19,6 @@ isolate via `dart:ffi`.
 - [`copy_dist.cmake`](copy_dist.cmake) - helper to copy DLLs into the dist
   folder after build.
 - [`.clang-format`](.clang-format) - code formatting rules.
-- [`.clangd`](.clangd) - LSP configuration for clangd.
 
 ## Requirements
 
