@@ -32,7 +32,6 @@ add_library(llama_bridge SHARED
     llama_bridge.h
     llama_bridge.cpp
     nlohmann/json.hpp
-    minja.hpp
 )
 target_compile_definitions(llama_bridge PRIVATE LLAMA_BRIDGE_EXPORTS)
 target_link_libraries(llama_bridge PUBLIC llama ggml)

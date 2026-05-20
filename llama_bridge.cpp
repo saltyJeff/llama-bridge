@@ -1,14 +1,16 @@
 #include "llama_bridge.h"
 #include <atomic>
 #include <llama.h>
-#include <minja.hpp> // imports nhlohmann json into global namespace??
 #include <nlohmann/json.hpp>
 #include <regex>
 #include <string>
 #include <string_view>
 #include <vector>
+#include <stdexcept>
+#include <sstream>
 
 using namespace std;
+using namespace nlohmann;
 
 const char *llama_bridge_get_devices(const char *backend_path)
 {
@@ -43,6 +45,102 @@ const char *llama_bridge_get_devices(const char *backend_path)
     return devbuf.c_str();
 }
 
+constexpr std::string_view WHITESPACE = " \n\r\t\f\v";
+
+std::string_view trim(std::string_view s)
+{
+    size_t start = s.find_first_not_of(WHITESPACE);
+    if (start == std::string_view::npos)
+        return {}; // All whitespace or empty
+
+    size_t end = s.find_last_not_of(WHITESPACE);
+    return s.substr(start, end - start + 1);
+}
+
+std::string apply_qwen35_chat_template(const std::vector<llama_chat_message> &msgs, bool thinking_flag, bool add_ass)
+{
+    if (msgs.empty())
+    {
+        throw std::runtime_error("No messages provided.");
+    }
+
+    std::ostringstream ss;
+
+    for (size_t i = 0; i < msgs.size(); ++i)
+    {
+        const auto &msg = msgs[i];
+
+        if (!msg.role)
+        {
+            throw std::runtime_error("Message role cannot be null.");
+        }
+
+        std::string_view role(msg.role);
+        std::string_view content(msg.content ? msg.content : "");
+
+        if (role != "user" && role != "assistant" && role != "system")
+        {
+            throw std::runtime_error(std::string("Invalid role: ") + std::string(role));
+        }
+
+        // Zero-copy trim
+        content = trim(content);
+
+        if (role == "system")
+        {
+            if (i != 0)
+            {
+                throw std::runtime_error("System message must be at the beginning.");
+            }
+            ss << "<|im_start|>system\n" << content << "<|im_end|>\n";
+        }
+        else if (role == "user")
+        {
+            ss << "<|im_start|>user\n" << content << "<|im_end|>\n";
+        }
+        else if (role == "assistant")
+        {
+            // Strip <think>...</think> from history to save context
+            size_t think_end_pos = content.find("</think>");
+            if (think_end_pos != std::string_view::npos)
+            {
+                // Keep everything after </think> (zero-copy slice)
+                content = content.substr(think_end_pos + 8);
+
+                // Mimic template's .lstrip('\n')
+                size_t first_non_newline = content.find_first_not_of('\n');
+                if (first_non_newline != std::string_view::npos)
+                {
+                    content = content.substr(first_non_newline);
+                }
+                else
+                {
+                    content = {}; // Result is entirely newlines
+                }
+            }
+
+            ss << "<|im_start|>assistant\n" << content << "<|im_end|>\n";
+        }
+    }
+
+    // Handle add_generation_prompt
+    if (add_ass)
+    {
+        ss << "<|im_start|>assistant\n";
+        if (thinking_flag)
+        {
+            ss << "<think>\n";
+        }
+        else
+        {
+            // Explicitly disable thinking but provide the expected tags
+            ss << "<think>\n\n</think>\n\n";
+        }
+    }
+    // Only one dynamic memory allocation occurs here, when the final string is materialized
+    return ss.str();
+}
+
 struct llama_bridge_obj
 {
     llama_model *model = nullptr;
@@ -50,7 +148,6 @@ struct llama_bridge_obj
     const llama_vocab *vocab = nullptr;
     llama_sampler *smpl = nullptr;
     ggml_backend_dev_t *devices = nullptr;
-    shared_ptr<minja::TemplateNode> tmpl;
 
     int n_ctx;
     int n_pos = 0;
@@ -98,9 +195,6 @@ struct llama_bridge_obj
         }
 
         vocab = llama_model_get_vocab(model);
-        const char *raw_tmpl = llama_model_chat_template(model, nullptr);
-        std::string new_tmpl = regex_replace(raw_tmpl, regex{"multi_step_tool=true"}, "multi_step_tool=false");
-        tmpl = minja::Parser::parse(new_tmpl, {});
 
         llama_context_params ctx_params = llama_context_default_params();
         ctx_params.n_ctx = 48 * 1024;
@@ -218,26 +312,6 @@ struct llama_bridge_obj
             llama_model_free(model);
     }
 
-    std::string apply_chat_template(const std::vector<llama_chat_message> &msgs, bool thinking_flag, bool add_ass)
-    {
-        json minja_ctx = json::object();
-        json minja_ctx_msgs = json::array();
-        for (const auto &msg : msgs)
-        {
-            std::string role(msg.role);
-            if (role != "user" && role != "assistant" && role != "system")
-            {
-                throw std::runtime_error(std::string("Invalid role: ") + std::string(role));
-            }
-            minja_ctx_msgs.push_back(json{{"role", msg.role}, {"content", msg.content}});
-        }
-        minja_ctx["messages"] = minja_ctx_msgs;
-        minja_ctx["enable_thinking"] = thinking_flag;
-        minja_ctx["add_generation_prompt"] = add_ass;
-        minja_ctx["multi_step_tool"] = false;
-        return tmpl->render(minja::Context::make(minja::Value(minja_ctx)));
-    }
-
     void set_sampler_params(double temp_in, int32_t top_k_in, double min_p_in, double top_p_in, double presence_penalty_in, int64_t seed_in)
     {
         temp = temp_in;
@@ -331,7 +405,7 @@ struct llama_bridge_obj
             chat_msgs.insert(chat_msgs.begin(), {"system", ""});
         }
 
-        string formatted = apply_chat_template(chat_msgs, thinking, false);
+        string formatted = apply_qwen35_chat_template(chat_msgs, thinking, false);
 
         // Tokenize and decode initial state
         cached_tokens = tokenize(formatted, true);
@@ -352,7 +426,7 @@ struct llama_bridge_obj
         }
 
         // 2. Format the entire sequence and let minja trim/strip whatever it wants
-        string formatted = apply_chat_template(chat_msgs, thinking, true);
+        string formatted = apply_qwen35_chat_template(chat_msgs, thinking, true);
 
         // 3. Tokenize the entire template (must use add_special=true to match reset_ctx)
         vector<llama_token> new_tokens = tokenize(formatted, true);
@@ -396,6 +470,7 @@ struct llama_bridge_obj
                 break;
             }
             llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
+            llama_sampler_accept(smpl, new_token_id);
 
             if (llama_vocab_is_eog(vocab, new_token_id))
             {
